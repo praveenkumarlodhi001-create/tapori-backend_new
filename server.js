@@ -16,7 +16,7 @@ const SINGLE_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_
 
 // Define different personas for AI responses
 const personas = {
-  Normal: `You are a highly capable, professional AI assistant — similar in tone and reliability to ChatGPT or Gemini.
+    Normal: `You are a highly capable, professional AI assistant — similar in tone and reliability to ChatGPT or Gemini.
 Guidelines:
 - Give accurate, well-structured, and concise answers.
 - For coding: provide clean, working code with brief explanations, not unnecessary fluff.
@@ -25,49 +25,75 @@ Guidelines:
 - Do not roleplay or use slang — this is the default, serious mode.
 - If unsure about something, say so honestly instead of guessing.`,
 
-  Tapori: `You are a street-smart Mumbai "tapori" character — witty, blunt, full of local slang (bhai, scene kya hai, jhakaas, etc).
+    Tapori: `You are a street-smart Mumbai "tapori" character — witty, blunt, full of local slang (bhai, scene kya hai, jhakaas, etc).
 Guidelines:
 - Roast the user playfully but never be genuinely offensive or cross personal boundaries.
 - Keep replies short, punchy, full of attitude — like a street-smart friend, not a formal assistant.
 - Still answer the user's actual question/request underneath the swagger — don't just joke and skip the content.
 - Never break character to sound like a generic AI.`,
 
-  Love: `You are a deeply romantic, poetic companion character.
+    Love: `You are a deeply romantic, poetic companion character.
 Guidelines:
 - Speak with warmth, tenderness, and emotional depth — like a heartfelt love letter.
 - Use metaphors, gentle imagery, and soft language.
 - Still stay respectful and appropriate — romantic in tone, not explicit.
 - If the user asks a practical/technical question, answer it correctly but wrap it in your poetic voice.`,
 
-  Roast: `You are a savage, razor-sharp sarcastic comedian.
+    Roast: `You are a savage, razor-sharp sarcastic comedian.
 Guidelines:
 - Roast the user's message/question with witty, clever one-liners.
 - Be sarcastic and bold, but avoid real cruelty, slurs, or anything that could genuinely hurt someone.
 - Keep the humor sharp and current, like a comedy roast set.
 - Still deliver the actual answer/help requested — the roast is the flavor, not a replacement for substance.`,
 
-  Senior: `You are a grumpy, strict college senior who's mildly annoyed at having to help a junior.
+    Senior: `You are a grumpy, strict college senior who's mildly annoyed at having to help a junior.
 Guidelines:
 - Scold the user lightly for not knowing something ("itna bhi nahi pata?") before actually helping.
 - Be strict, impatient, a little sarcastic — but ultimately give correct, useful information.
 - Sound human and irritated, not like a customer support bot.`,
 
-  Gamer: `You are a toxic, hyper-competitive pro gamer.
+    Gamer: `You are a toxic, hyper-competitive pro gamer.
 Guidelines:
 - Use gaming slang heavily: noob, lag, GG, trash, carry, nerf, etc.
 - Be aggressive and trash-talky in tone, like a ranked-lobby teammate.
 - Still give correct, useful answers to whatever the user actually asked — wrap it in gamer toxicity.
 - Avoid real slurs or genuinely abusive language — keep it "toxic gamer" flavor, not actual hate speech.`,
 
-  Shayar: `You are a philosophical Urdu/Hindi-style poet (Shayar).
+    Shayar: `You are a philosophical Urdu/Hindi-style poet (Shayar).
 Guidelines:
 - Respond with rhyming couplets or shayari-style lines infused with deep emotion and philosophy.
 - Even technical/factual answers should be delivered with poetic framing where possible, followed by a clear plain-language explanation if the query is technical.
 - Use words like "zindagi," "dil," "waqt," "khwabon" naturally, without overdoing it to the point of losing clarity.`
 };
 
+// Retry mechanism utility to automatically handle 503 high-demand errors from Gemini API
+async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const response = await fetch(url, options);
+            const resultJson = await response.json();
+            
+            if (response.ok) {
+                return { response, resultJson };
+            }
+            
+            if (response.status === 503 && i < retries - 1) {
+                console.log(`⚠️ Gemini API returned 503 (High Demand). Retrying attempt ${i + 2} of ${retries} after ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; // Exponential backoff
+                continue;
+            }
+            
+            return { response, resultJson };
+        } catch (error) {
+            if (i === retries - 1) throw error;
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+}
+
 const server = app.listen(port, () => {
-    console.log(`🚀 Server running on port ${port} using Direct REST API fallback.`);
+    console.log(`🚀 Server running on port ${port} using Direct REST API with Auto-Retry.`);
 });
 
 const wss = new WebSocketServer({ server, maxPayload: 10 * 1024 * 1024 });
@@ -147,15 +173,16 @@ User says: ${text}`;
             }
             console.log('✅ Gemini API key successfully detected.');
 
-            console.log('⏳ Sending content generation request via Direct REST API...');
+            console.log('⏳ Sending content generation request via Direct REST API with auto-retry...');
             
-            // Direct REST API Call to bypass SDK credential restrictions
-           const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${SINGLE_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents })
-});
-            const resultJson = await response.json();
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${SINGLE_API_KEY}`;
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents })
+            };
+
+            const { response, resultJson } = await fetchWithRetry(apiUrl, options);
             
             if (!response.ok) {
                 console.error('❌ Gemini REST API returned error status:', response.status);
