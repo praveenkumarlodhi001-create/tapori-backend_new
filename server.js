@@ -175,7 +175,7 @@ User says: ${text}`;
 
             console.log('⏳ Sending content generation request via Direct REST API with auto-retry...');
             
-            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${SINGLE_API_KEY}`;
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${SINGLE_API_KEY}`;
             const options = {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
