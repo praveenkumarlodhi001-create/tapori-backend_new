@@ -5,6 +5,15 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+app.use(express.json({ limit: '2mb' }));
+
+// Permissive CORS so the Expo app (and web preview, if used) can call the REST routes below.
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-app-token');
+    next();
+});
+
 // Root endpoint for health check
 app.get('/', (req, res) => {
     console.log('🌐 HTTP GET request received at root endpoint "/"');
@@ -13,6 +22,17 @@ app.get('/', (req, res) => {
 
 // Fetching the API Key from environment variables
 const SINGLE_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_1;
+
+// Shared connection token (used by both the WebSocket handshake and the REST routes below).
+const APP_TOKEN = process.env.APP_TOKEN || "ROASTIFY_SECRET_123";
+
+function requireAppToken(req, res, next) {
+    const token = req.headers['x-app-token'] || req.query.token;
+    if (token !== APP_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
 
 // Define different personas for AI responses
 const personas = {
@@ -85,6 +105,140 @@ async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
     }
 }
 
+// ==================================================================
+// Daily Puzzle feature — AI-generated, persona-flavored, cached once
+// per day so every user gets the same puzzle (and we don't burn a
+// Gemini call per user per guess).
+// ==================================================================
+
+// In-memory cache: { "YYYY-MM-DD_Persona": { question, answer, hint } }
+// NOTE: lives in server memory, so it resets on redeploy/restart. Fine for
+// a single-instance "same puzzle for everyone today" feature — if you ever
+// scale to multiple instances, move this to a shared store (DB/Redis).
+const puzzleCache = {};
+
+function getTodayKey() {
+    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+function pickRandom(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+const puzzleFlavor = {
+    Normal: {
+        correct: ["Correct! Well solved.", "Nice work — that's the right answer."],
+        incorrect: ["Not quite. Give it another shot.", "That's not it — try again."]
+    },
+    Tapori: {
+        correct: ["Ekdum sahi bhidu! Dimaag chalta hai tera!", "Waah bhai, seedha bull's eye!"],
+        incorrect: ["Arre nahi yaar, dimaag laga thoda!", "Galat bhidu, phir se try maar."]
+    },
+    Love: {
+        correct: ["Yes baby, you got it! So proud of you 🥰", "Perfect! You're so smart, I love that."],
+        incorrect: ["Aww no, that's not it — but I still love you. Try again?", "Not quite jaan, one more try for me?"]
+    },
+    Roast: {
+        correct: ["Wow, a correct answer? Miracles do happen.", "Congrats, your one brain cell finally worked."],
+        incorrect: ["Bro that answer was tragic. Try again before I lose hope in humanity.", "Nope. Google exists for a reason, use it next time."]
+    },
+    Senior: {
+        correct: ["Chal theek hai, aaj bach gaya. Sahi hai.", "Sahi jawab hai — dekh, hota hai agar dimaag lagaye to."],
+        incorrect: ["Abe galat! Itna simple sawaal bhi nahi hota tujhse?", "Ye kya jawab hai chomu, dobara soch."]
+    },
+    Gamer: {
+        correct: ["GG WP! That's a clean solve, no lag no excuses.", "Clutch answer bro, MVP energy."],
+        incorrect: ["Bro that was a straight up throw. Try again.", "Skill issue detected. Retry the puzzle."]
+    },
+    Shayar: {
+        correct: ["Sahi jawab, jaise sahi waqt par mile do dil.", "Waah, jawab bhi shayari jaisa sateek nikla."],
+        incorrect: ["Nahi, ye jawab adhoora sa laga — jaise koi khwaab toota ho.", "Galat hai ye, phir se koshish kar, umeed abhi baaki hai."]
+    }
+};
+
+async function generatePuzzle(personaKey) {
+    const systemFlavor = personas[personaKey] || personas.Normal;
+    const puzzlePrompt = `
+${systemFlavor}
+
+Task: Generate ONE short daily brain-teaser/riddle suitable for a general audience (no explicit content).
+It must have a single short, unambiguous correct answer (one word or a short phrase).
+Respond with STRICT JSON only, no markdown, no extra text, in exactly this shape:
+{"question": "...", "answer": "...", "hint": "..."}
+The "question" should be written in the voice/style described above, but the puzzle itself must stay solvable and fair.
+`.trim();
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${SINGLE_API_KEY}`;
+    const options = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: puzzlePrompt }] }] })
+    };
+
+    const { response, resultJson } = await fetchWithRetry(apiUrl, options);
+    if (!response.ok) {
+        throw new Error(resultJson.error?.message || `Puzzle generation failed: ${response.status}`);
+    }
+
+    const rawText = resultJson.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const cleaned = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+    let parsed;
+    try {
+        parsed = JSON.parse(cleaned);
+    } catch (e) {
+        console.error('❌ Failed to parse puzzle JSON from Gemini:', cleaned);
+        throw new Error('Puzzle generation returned invalid format.');
+    }
+
+    if (!parsed.question || !parsed.answer) {
+        throw new Error('Puzzle generation returned incomplete data.');
+    }
+    return parsed;
+}
+
+// GET /daily-puzzle?persona=Roast&token=... — returns today's question (never the answer).
+app.get('/daily-puzzle', requireAppToken, async (req, res) => {
+    try {
+        const personaKey = personas[req.query.persona] ? req.query.persona : 'Normal';
+        const cacheKey = `${getTodayKey()}_${personaKey}`;
+
+        if (!puzzleCache[cacheKey]) {
+            console.log(`🧩 Generating fresh daily puzzle for persona: ${personaKey}`);
+            puzzleCache[cacheKey] = await generatePuzzle(personaKey);
+        }
+
+        const { question, hint } = puzzleCache[cacheKey];
+        res.status(200).json({ date: getTodayKey(), persona: personaKey, question, hint: hint || null });
+    } catch (error) {
+        console.error('❌ /daily-puzzle error:', error.message || error);
+        res.status(503).json({ error: "Could not generate today's puzzle. Please try again shortly." });
+    }
+});
+
+// POST /daily-puzzle/check?token=... — body: { persona, answer } — validates against the cached answer.
+app.post('/daily-puzzle/check', requireAppToken, (req, res) => {
+    const personaKey = personas[req.body.persona] ? req.body.persona : 'Normal';
+    const cacheKey = `${getTodayKey()}_${personaKey}`;
+    const cached = puzzleCache[cacheKey];
+
+    if (!cached) {
+        return res.status(409).json({ error: 'No puzzle generated yet for today. Fetch /daily-puzzle first.' });
+    }
+
+    const normalize = (s) => (s || '').toString().trim().toLowerCase().replace(/[^\w\s]/g, '');
+    const isCorrect = normalize(req.body.answer) === normalize(cached.answer);
+    const flavor = puzzleFlavor[personaKey] || puzzleFlavor.Normal;
+    const message = isCorrect ? pickRandom(flavor.correct) : pickRandom(flavor.incorrect);
+
+    res.status(200).json({
+        correct: isCorrect,
+        message,
+        // Only ever reveal the real answer on a correct guess.
+        answer: isCorrect ? cached.answer : undefined
+    });
+});
+
 const server = app.listen(port, () => {
     console.log(`🚀 Server running on port ${port} using Direct REST API with Auto-Retry.`);
 });
@@ -98,7 +252,7 @@ wss.on('connection', (ws, req) => {
         const token = url.searchParams.get('token');
         console.log(`🔑 Extracted Token from URL parameters: ${token ? token : 'None provided'}`);
 
-        if (token !== "ROASTIFY_SECRET_123") {
+        if (token !== APP_TOKEN) {
             console.log('❌ UNAUTHORIZED ACCESS: Connection token mismatch! Closing connection.');
             ws.close();
             return; 
