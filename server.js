@@ -17,8 +17,11 @@ app.use((req, res, next) => {
 // Root endpoint for health check
 app.get('/', (req, res) => {
     console.log('🌐 HTTP GET request received at root endpoint "/"');
-    res.status(200).send('🚀 Tapori AI WebSocket Backend is Live and Running!');
+    res.status(200).send('🚀 Persona Lab WebSocket Backend is Live and Running!');
 });
+
+// Note: the Arcade hub (Snake / Ludo / Carrom) added in this release is fully
+// client-side — no game state, moves, or scores are sent to this server.
 
 // Fetching the API Key from environment variables
 const SINGLE_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_1;
